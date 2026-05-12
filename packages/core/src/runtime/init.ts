@@ -1263,6 +1263,10 @@ export function initSandboxRuntimeModular(): void {
       // timed clips and would never promote them back.
       for (const mediaEl of mediaEls) {
         if (!mediaEl.hasAttribute("data-start")) continue;
+        // Power-user opt-out: data-preload-eager keeps a clip eagerly buffered
+        // even under lazy mode, useful when a specific clip must be instantly
+        // available regardless of playhead proximity.
+        if (mediaEl.hasAttribute("data-preload-eager")) continue;
         if (mediaEl.preload === "auto" || mediaEl.preload === "") {
           mediaEl.preload = "metadata";
           // Kick off the metadata fetch explicitly — some browsers (Chrome Lite

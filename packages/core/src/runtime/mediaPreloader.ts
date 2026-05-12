@@ -38,7 +38,11 @@ export function createMediaPreloadManager(options?: {
   function refresh(): void {
     const cache = refreshRuntimeMediaCache(options);
     clips = cache.mediaClips;
-    lazy = clips.length >= LAZY_THRESHOLD;
+    const configuredThreshold =
+      typeof (window as Record<string, unknown>).__HF_LAZY_PRELOAD_THRESHOLD === "number"
+        ? ((window as Record<string, unknown>).__HF_LAZY_PRELOAD_THRESHOLD as number)
+        : LAZY_THRESHOLD;
+    lazy = clips.length >= configuredThreshold;
     if (lazy && !activationEmitted) {
       activationEmitted = true;
       options?.onActivation?.(clips.length);

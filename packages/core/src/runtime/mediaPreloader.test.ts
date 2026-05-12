@@ -322,4 +322,37 @@ describe("createMediaPreloadManager", () => {
 
     expect(onActivation).toHaveBeenCalledOnce();
   });
+
+  it("respects window.__HF_LAZY_PRELOAD_THRESHOLD override", () => {
+    elements = Array.from({ length: 4 }, (_, i) =>
+      mockMediaElement({ start: String(i * 5), duration: "5" }),
+    );
+    setupDOM(elements);
+
+    // 4 elements is below the default threshold (6) but at our custom one
+    (window as Record<string, unknown>).__HF_LAZY_PRELOAD_THRESHOLD = 4;
+
+    const manager = createMediaPreloadManager();
+    manager.refresh();
+
+    expect(manager.isLazy()).toBe(true);
+
+    // Clean up
+    delete (window as Record<string, unknown>).__HF_LAZY_PRELOAD_THRESHOLD;
+  });
+
+  it("falls back to default threshold when __HF_LAZY_PRELOAD_THRESHOLD is not set", () => {
+    elements = Array.from({ length: 4 }, (_, i) =>
+      mockMediaElement({ start: String(i * 5), duration: "5" }),
+    );
+    setupDOM(elements);
+
+    // Ensure it's not set
+    delete (window as Record<string, unknown>).__HF_LAZY_PRELOAD_THRESHOLD;
+
+    const manager = createMediaPreloadManager();
+    manager.refresh();
+
+    expect(manager.isLazy()).toBe(false);
+  });
 });
