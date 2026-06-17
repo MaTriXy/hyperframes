@@ -143,3 +143,5 @@ docs/superpowers/
 .worktrees
 hyperframes-bench/
 tmp/
+# Studio-generated preview thumbnails
+.thumbnails/

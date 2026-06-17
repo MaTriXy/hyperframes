@@ -203,6 +203,7 @@ export function useDomEditSession({
     resolveImportedFontAsset,
     handleDomStyleCommit,
     handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
     handleDomHtmlAttributeCommit,
     handleDomTextCommit,
     handleDomTextFieldStyleCommit,
@@ -265,8 +266,6 @@ export function useDomEditSession({
     handleGsapRemoveAllKeyframes,
     handleResetSelectedElementKeyframes,
   } = useDomEditWiring({
-    // Pre-existing prop-drilling clone (same param set forwarded to
-    // useDomEditWiring); surfaced by this PR's adjacent edits, not introduced.
     // fallow-ignore-next-line code-duplication
     projectId,
     activeCompPath,
@@ -334,6 +333,7 @@ export function useDomEditSession({
     commitAnimatedProperty,
     handleSetArcPath,
     handleUpdateArcSegment,
+    handleUnroll,
     commitMutation,
   } = useGsapAwareEditing({
     domEditSelection,
@@ -373,6 +373,7 @@ export function useDomEditSession({
     clearDomSelection,
     handleDomStyleCommit,
     handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
     handleDomHtmlAttributeCommit,
     handleDomPathOffsetCommit: handleGsapAwarePathOffsetCommit,
     handleDomGroupPathOffsetCommit,
@@ -420,6 +421,7 @@ export function useDomEditSession({
     commitAnimatedProperty,
     handleSetArcPath,
     handleUpdateArcSegment,
+    handleUnroll,
     invalidateGsapCache: bumpGsapCache,
     previewIframeRef,
     commitMutation,

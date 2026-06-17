@@ -32,6 +32,17 @@ function fresh(script = GSAP_SCRIPT) {
   return parseMutable(makeHtml(script));
 }
 
+// A sub-composition host: data-hf-id="hf-host" (its own leaf id) AND
+// data-composition-id="sub-1" (the id studio passes when targeting the root).
+function freshSubComp(script = GSAP_SCRIPT) {
+  return parseMutable(
+    `<div data-hf-id="hf-stage" data-hf-root style="width: 1280px; height: 720px">
+  <div data-hf-id="hf-host" data-composition-id="sub-1" style="opacity: 0"></div>
+  <script>${script}</script>
+</div>`.trim(),
+  );
+}
+
 function getScript(parsed: ReturnType<typeof parseMutable>): string {
   const doc = serializeDocument(parsed);
   const m = /<script>([\s\S]*?)<\/script>/i.exec(doc);
@@ -188,6 +199,77 @@ describe("addGsapTween", () => {
     });
     expect(result.forward).toHaveLength(0);
   });
+
+  // A normal data-hf-id target keeps the [data-hf-id] selector form.
+  it("emits a [data-hf-id] selector for a normal element target", () => {
+    const result = applyOp(fresh(), {
+      type: "addGsapTween",
+      target: "hf-box",
+      tween: { method: "to", properties: { x: 1 } },
+    });
+    const script = String(result.forward[0]?.value ?? "");
+    expect(script).toContain(`[data-hf-id=\\"hf-box\\"]`);
+    expect(script).not.toContain("data-composition-id");
+  });
+
+  // A sub-composition ROOT is addressed by its composition id, but the SDK's
+  // element↔tween attribution is data-hf-id based. So a comp-id target must
+  // resolve to the host element and emit the CANONICAL [data-hf-id="<host>"]
+  // form — NOT [data-composition-id] (invisible to selectorMatchesId / cascade /
+  // buildAnimationIdMap) and NOT [data-hf-id="<compId>"] (matches no element).
+  it("emits a canonical [data-hf-id] selector for a sub-composition root target", () => {
+    const result = applyOp(freshSubComp(), {
+      type: "addGsapTween",
+      target: "sub-1",
+      tween: { method: "to", properties: { x: 1 } },
+    });
+    const script = String(result.forward[0]?.value ?? "");
+    expect(script).toContain(`[data-hf-id=\\"hf-host\\"]`);
+    expect(script).not.toContain("data-composition-id");
+    expect(script).not.toContain(`[data-hf-id=\\"sub-1\\"]`);
+  });
+
+  // validateOp/can must accept a comp-root target (resolveScoped's comp-id
+  // fallback resolves it) — otherwise can/apply diverge.
+  it("validateOp accepts a sub-composition root target (no E_TARGET_NOT_FOUND)", () => {
+    const r = validateOp(freshSubComp(), {
+      type: "addGsapTween",
+      target: "sub-1",
+      tween: { method: "to", properties: { x: 1 } },
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  // setTiming on the comp-root after adding a tween updates the tween's GSAP
+  // position/duration — selectorMatchesId matches the canonical host hf-id.
+  it("setTiming on a comp-root syncs its tween position/duration", () => {
+    // applyOp mutates parsed.document in place, so chain ops on the same parsed.
+    const parsed = freshSubComp();
+    applyOp(parsed, {
+      type: "addGsapTween",
+      target: "sub-1",
+      tween: { method: "to", duration: 0.5, properties: { x: 1 } },
+    });
+    applyOp(parsed, { type: "setTiming", target: "sub-1", start: 2, duration: 1.5 });
+    const script = getScript(parsed);
+    // The host tween's GSAP position (3rd arg) is now 2 and duration 1.5.
+    expect(script).toContain(`[data-hf-id=\\"hf-host\\"]`);
+    expect(script).toMatch(/duration:\s*1\.5/);
+    expect(script).toMatch(/\},\s*2\)/);
+  });
+
+  // removeElement on the comp-root cascade-removes its tween (not orphaned).
+  it("removeElement on a comp-root cascade-removes its tween", () => {
+    const parsed = freshSubComp();
+    applyOp(parsed, {
+      type: "addGsapTween",
+      target: "sub-1",
+      tween: { method: "to", properties: { x: 1 } },
+    });
+    expect(getScript(parsed)).toContain(`[data-hf-id=\\"hf-host\\"]`);
+    applyOp(parsed, { type: "removeElement", target: "sub-1" });
+    expect(getScript(parsed)).not.toContain(`[data-hf-id=\\"hf-host\\"]`);
+  });
 });
 
 // ─── Tween op test helpers ────────────────────────────────────────────────────
@@ -288,6 +370,38 @@ describe("addGsapKeyframe", () => {
     expect(newScript).toContain('"25%"');
     expect(newScript).toContain("opacity: 0.3");
   });
+
+  it("backfills a NEW property into the other keyframes, matching the recast writer", async () => {
+    const parsed = fresh(KF_SCRIPT);
+    const animId = `[data-hf-id="hf-box"]-to-0-visual`;
+    const result = applyOp(parsed, {
+      type: "addGsapKeyframe",
+      animationId: animId,
+      position: 25,
+      // `x` is brand-new to this keyframe set: it must be backfilled into the
+      // existing keyframes so GSAP interpolates rather than snaps.
+      value: { opacity: 0.3, x: 120 },
+    });
+    expect(result.forward).toHaveLength(1);
+    const newScript = String(result.forward[0]?.value ?? "");
+
+    // Parse the SDK-written script and compare against the recast writer fed the
+    // same backfillDefaults the studio always sends (`PROPERTY_DEFAULTS[k] ?? 0`).
+    const { parseGsapScript, addKeyframeToScript } = await import("@hyperframes/core/gsap-parser");
+    const recast = addKeyframeToScript(KF_SCRIPT, animId, 25, { opacity: 0.3, x: 120 }, undefined, {
+      opacity: 1,
+      x: 0,
+    });
+    const kfOf = (s: string) =>
+      parseGsapScript(s)
+        .animations[0]?.keyframes?.keyframes?.slice()
+        .sort((a, b) => a.percentage - b.percentage)
+        .map((k) => ({ percentage: k.percentage, properties: k.properties }));
+    expect(kfOf(newScript)).toEqual(kfOf(recast));
+
+    // Every keyframe carries `x` (the new prop backfilled at its default 0).
+    expect(newScript).toContain("x: 0");
+  });
 });
 
 describe("setGsapKeyframe", () => {
@@ -331,6 +445,33 @@ describe("setGsapKeyframe", () => {
     expect(newScript).toContain('"60%"');
     expect(newScript).not.toContain('"50%"');
     expect(newScript).toContain("opacity: 0.7");
+  });
+
+  it("move with a new prop threads backfill defaults into sibling keyframes (matches add path)", async () => {
+    const parsed = fresh(KF_SCRIPT);
+    const animId = `[data-hf-id="hf-box"]-to-0-visual`;
+    // Move the 50% keyframe to 60% while introducing a NEW prop `x`. The move
+    // path (remove + re-add) must seed `x` into the other keyframes with its
+    // default, exactly like the add path does.
+    const result = applyOp(parsed, {
+      type: "setGsapKeyframe",
+      animationId: animId,
+      keyframeIndex: 1,
+      position: 60,
+      value: { opacity: 0.5, x: 120 },
+    });
+    expect(result.forward).toHaveLength(1);
+    const newScript = String(result.forward[0]?.value ?? "");
+
+    // The 0% and 100% keyframes should now carry `x` backfilled at its default 0.
+    const { parseGsapScript } = await import("@hyperframes/core/gsap-parser");
+    const kfs = parseGsapScript(newScript)
+      .animations[0]?.keyframes?.keyframes?.slice()
+      .sort((a, b) => a.percentage - b.percentage);
+    expect(kfs?.map((k) => k.percentage)).toEqual([0, 60, 100]);
+    expect(kfs?.find((k) => k.percentage === 0)?.properties.x).toBe(0);
+    expect(kfs?.find((k) => k.percentage === 100)?.properties.x).toBe(0);
+    expect(kfs?.find((k) => k.percentage === 60)?.properties.x).toBe(120);
   });
 
   it("ease-only update (same position, no value) does not corrupt keyframe", () => {

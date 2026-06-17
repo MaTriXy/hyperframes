@@ -407,12 +407,12 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
 
     ```bash
     npx hyperframes capture https://stripe.com
-    npx hyperframes capture https://linear.app -o captures/linear
+    npx hyperframes capture https://linear.app -o linear-capture
     npx hyperframes capture https://example.com --json
     ```
 
     ```
-    ◇  Captured Stripe | Financial Infrastructure → captures/stripe-com
+    ◇  Captured Stripe | Financial Infrastructure → capture
 
       Screenshots: 12
       Assets: 45
@@ -422,7 +422,7 @@ This is suppressed in CI environments, non-TTY shells, and when `HYPERFRAMES_NO_
 
     | Flag | Description |
     |------|-------------|
-    | `-o, --output` | Output directory (default: `captures/<hostname>`) |
+    | `-o, --output` | Output directory (default: `./capture`; auto-suffixes to `./capture-2/`, `./capture-3/`, … if `./capture/` is taken) |
     | `--timeout` | Page load timeout in ms (default: 120000) |
     | `--skip-assets` | Skip downloading images and fonts |
     | `--max-screenshots` | Maximum screenshot count (default: 24) |
@@ -1019,7 +1019,8 @@ Render parameters mirror the local `hyperframes render` UX where they overlap:
 | `--fps` | `30` | Integer 1-240. |
 | `--quality` | `standard` | `draft`, `standard`, or `high`. |
 | `--format` | `mp4` | `mp4`, `webm`, or `mov`. |
-| `--resolution` | composition default | `landscape`, `portrait`, `landscape-4k`, `portrait-4k`, `square`, `square-4k`. |
+| `--resolution` | `1080p` | `1080p` or `4k`. 4k is billed at 1.5× and can't be combined with `webm`/`mov`. |
+| `--aspect-ratio` | auto | `16:9`, `9:16`, or `1:1`. Auto-detected from a local project's `data-width`/`data-height`; for `--asset-id`/`--url` it defaults to `16:9` unless set. |
 | `--composition` / `-c` | `index.html` | Entry HTML file inside the zip. |
 | `--variables` | — | Inline JSON object overriding `data-composition-variables`. |
 | `--variables-file` | — | Path to a JSON file (alternative to `--variables`). |
