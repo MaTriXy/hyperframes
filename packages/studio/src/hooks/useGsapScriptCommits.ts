@@ -1,10 +1,13 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useMemo, useRef } from "react";
+import { editLog } from "../utils/editDebugLog";
 import { findUnsafeMutationValues } from "@hyperframes/core/studio-api/finite-mutation";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
-import { applySoftReload } from "../utils/gsapSoftReload";
-import { resolveGsapFidelityArgs, runShadowGsapFidelity } from "../utils/sdkShadowGsapFidelity";
-import { runShadowGsapKeyframeFidelity } from "../utils/sdkShadowGsapKeyframe";
+import { applySoftReload, extractGsapScriptText } from "../utils/gsapSoftReload";
+import type { SoftReloadResult } from "../utils/gsapSoftReload";
+import { trackStudioEvent } from "../utils/studioTelemetry";
+import type { CutoverDeps } from "../utils/sdkCutover";
 import { updateKeyframeCacheFromParsed } from "./gsapKeyframeCacheHelpers";
+import { patchRuntimeTweenInPlace } from "./gsapRuntimePatch";
 import { createKeyedSerializer } from "./serializeByKey";
 import {
   GsapMutationHttpError,
@@ -44,21 +47,95 @@ async function mutateGsapScript(
   return result;
 }
 
+/**
+ * Apply a soft reload and enforce the U4 invariant via the richer
+ * `SoftReloadResult`, with telemetry on every non-success path so the invariant
+ * is observable in production, not just asserted in tests:
+ *
+ * - `"cannot-soft-reload"` (PERMANENT/STRUCTURAL: no gsap runtime, no rebind
+ *   hook, no scopable key, no script element, or the sync re-run threw) →
+ *   escalate to a full `reloadPreview()`; the preview is genuinely stale/broken.
+ * - `"verify-failed"` (TRANSIENT: re-run happened, `__timelines` momentarily
+ *   empty) → do NOT escalate; the live `gsap.set` already shows the correct value
+ *   and a remount would re-flash the WebGL context + revert subcomp keyframes.
+ * - `"applied"` → success (or deferred to async plugin load; `onAsyncFailure`
+ *   covers the CDN-error escalation).
+ */
+function softReloadOrEscalate(
+  iframe: HTMLIFrameElement | null,
+  scriptText: string,
+  reloadPreview: () => void,
+  origin: "preview_sync" | "sdk_refresh",
+): void {
+  const result: SoftReloadResult = applySoftReload(iframe, scriptText, reloadPreview);
+  if (result === "applied") return;
+  trackStudioEvent("gsap_soft_reload_outcome", {
+    origin,
+    result,
+    escalated: result === "cannot-soft-reload",
+  });
+  // PERMANENT failure: the preview can't be soft-updated → full reload. TRANSIENT
+  // "verify-failed" is suppressed (live state is correct).
+  if (result === "cannot-soft-reload") reloadPreview();
+}
+
+/**
+ * Sync the preview after a persisted commit. For a value-only edit
+ * (`options.instantPatch`), try the in-place runtime patch first: on success the
+ * preview is already correct, so we skip the reload entirely (instant). On `false`
+ * — or when no `instantPatch` is supplied — fall back to the existing soft/full
+ * reload. Pure (no React) so `runCommit`'s preview-sync decision is unit-testable.
+ */
+export function applyPreviewSync(
+  iframe: HTMLIFrameElement | null,
+  result: MutationResult,
+  options: CommitMutationOptions,
+  reloadPreview: () => void,
+): void {
+  if (options.instantPatch) {
+    const patched = patchRuntimeTweenInPlace(
+      iframe,
+      options.instantPatch.selector,
+      options.instantPatch.change,
+    );
+    // Patched in place — element is already correct on screen; no reload needed.
+    if (patched) return;
+    // The instant path couldn't patch in place — record the fallback so we can
+    // track how often the fast path misses before the soft/full reload below.
+    trackStudioEvent("gsap_instant_patch_fallback", { selector: options.instantPatch.selector });
+    // Fall through to the soft/full reload path below.
+  }
+  if (options.softReload && result.scriptText) {
+    // A soft-reloadable edit escalates to a full iframe remount ONLY on the
+    // PERMANENT "cannot-soft-reload" result (the preview is genuinely stale/
+    // broken). The TRANSIENT "verify-failed" does NOT escalate — the value is
+    // already correct on screen, and a remount re-flashes the WebGL context AND
+    // re-inlines subcomps (reverting their keyframes). The async MotionPath-plugin
+    // load failure escalates separately via `onAsyncFailure`.
+    softReloadOrEscalate(iframe, result.scriptText, reloadPreview, "preview_sync");
+  } else {
+    reloadPreview();
+  }
+}
+
 // oxfmt-ignore
 // fallow-ignore-next-line complexity
-export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIframeRef, editHistory, domEditSaveTimestampRef, reloadPreview, onCacheInvalidate, onFileContentChanged, showToast, sdkSession }: GsapScriptCommitsParams) {
+export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIframeRef, editHistory, domEditSaveTimestampRef, reloadPreview, onCacheInvalidate, onFileContentChanged, showToast, sdkSession, writeProjectFile, forceReloadSdkSession }: GsapScriptCommitsParams) {
   // Serializer for per-key commits (options.serializeKey). Keyed by
   // `gsap:${animationId}:meta`, it chains a meta commit onto the prior one for
-  // the same animationId so their POSTs can't interleave — which is what made
-  // the shadow fidelity diff pair an op with a stale server result and report
-  // false ease mismatches. Held in a ref so the chain survives re-renders.
+  // the same animationId so their POSTs can't interleave. Held in a ref so the
+  // chain survives re-renders.
   const serializerRef = useRef(createKeyedSerializer());
-  // Pre-existing complexity (server mutate + history + reload branches); this PR
-  // adds only a guarded shadow-fidelity dispatch.
   // fallow-ignore-next-line complexity
   const runCommit = useCallback(async (selection: DomEditSelection, mutation: Record<string, unknown>, options: CommitMutationOptions) => {
     const pid = projectIdRef.current;
     if (!pid) return;
+    editLog("gsap-commit", {
+      type: mutation.type,
+      id: selection.id,
+      file: selection.sourceFile || activeCompPath,
+      label: options.label,
+    });
     const unsafeFields = findUnsafeMutationValues(mutation);
     if (unsafeFields.length > 0) {
       showToast?.("Couldn't read element layout — try again at a different playhead time", "error");
@@ -76,47 +153,27 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
     }
     if (result.changed === false) return;
     domEditSaveTimestampRef.current = Date.now();
-    // Shadow value fidelity: diff the SDK's GSAP writer output against the
-    // server's, from the same pre-op file. Fire-and-forget; server authoritative.
-    // Meta-level ops carry shadowGsapOp (add / update-meta / delete via
-    // useGsapAnimationOps); keyframe ops carry shadowKeyframeOp (add/remove via
-    // useGsapKeyframeOps, handled by the gsap_keyframe block below). Per-property
-    // handlers (useGsapPropertyDebounce) don't synthesize one yet — deferred follow-up.
-    // scriptText is null when the composition has no GSAP script; nothing to diff.
-    const fidelityArgs = resolveGsapFidelityArgs(
-      sdkSession,
-      options.shadowGsapOp,
-      result.before,
-      result.scriptText,
-    );
-    if (fidelityArgs) {
-      void runShadowGsapFidelity(fidelityArgs.before, fidelityArgs.op, fidelityArgs.serverScript);
-    }
-    // Keyframe value fidelity (gsap_keyframe): same serialize-diff approach, but
-    // the SDK has no keyframe reader so there is no live-existence path — the diff
-    // is the only signal. Guarded on a live session + both scripts to diff.
-    if (sdkSession && options.shadowKeyframeOp && result.before != null && result.scriptText != null) {
-      void runShadowGsapKeyframeFidelity(result.before, options.shadowKeyframeOp, result.scriptText);
-    }
     if (result.before != null && result.after != null) {
       await editHistory.recordEdit({ label: options.label, kind: "manual", coalesceKey: options.coalesceKey, files: { [targetPath]: { before: result.before, after: result.after } } });
     }
     if (result.after != null) onFileContentChanged?.(targetPath, result.after);
+    // Server wrote the file; the in-memory SDK doc is now stale. Resync it so a
+    // later SDK-routed edit doesn't serialize the pre-write doc and revert this.
+    forceReloadSdkSession?.();
     if (options.skipReload) return;
     if (result.parsed?.animations) updateKeyframeCacheFromParsed(result.parsed.animations, targetPath, selection.id ?? undefined, mutation);
     options.beforeReload?.();
-    if (options.softReload && result.scriptText) {
-      if (!applySoftReload(previewIframeRef.current, result.scriptText)) reloadPreview();
-    } else {
-      reloadPreview();
-    }
+    applyPreviewSync(previewIframeRef.current, result, options, reloadPreview);
     onCacheInvalidate();
-  }, [projectIdRef, activeCompPath, previewIframeRef, editHistory, domEditSaveTimestampRef, reloadPreview, onCacheInvalidate, onFileContentChanged, showToast, sdkSession]);
+    editLog("gsap-commit:done", {
+      type: mutation.type,
+      changed: result.changed,
+      instant: Boolean(options.instantPatch),
+    });
+  }, [projectIdRef, activeCompPath, previewIframeRef, editHistory, domEditSaveTimestampRef, reloadPreview, onCacheInvalidate, onFileContentChanged, showToast, forceReloadSdkSession]);
   // Every GSAP-script commit is a read-modify-write of one file. Overlapping
-  // commits to the SAME file (any op type, any animation) interleave server-side
-  // and make the shadow fidelity diff pair an op with a stale server result —
-  // the false ease/value mismatches this serializer exists to prevent. So
-  // serialize per target file by default; an explicit serializeKey overrides.
+  // commits to the SAME file (any op type, any animation) interleave server-side,
+  // so serialize per target file by default; an explicit serializeKey overrides.
   const commitMutation = useCallback(
     (selection: DomEditSelection, mutation: Record<string, unknown>, options: CommitMutationOptions) => {
       const file = selection.sourceFile || activeCompPath || "index.html";
@@ -127,9 +184,103 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
   );
   const trackGsapSaveFailure = useGsapSaveFailureTelemetry(activeCompPath);
   const commitMutationSafely = useSafeGsapCommitMutation(commitMutation, trackGsapSaveFailure, showToast);
-  const propertyOps = useGsapPropertyDebounce(commitMutationSafely);
-  const animationOps = useGsapAnimationOps({ projectIdRef, activeCompPath, commitMutation, commitMutationSafely, showToast, sdkSession });
-  const keyframeOps = useGsapKeyframeOps({ activeCompPath, commitMutation, commitMutationSafely, trackGsapSaveFailure });
+
+  // One stable SDK-deps object shared by all GSAP child hooks. Memoized so the
+  // hooks' callbacks keep a stable identity (an inline literal here re-fired the
+  // property-debounce flush on every render). refresh() soft-reloads (preserving
+  // the playhead) and invalidates the panel cache, matching the server path.
+  const sdkRefresh = useCallback(
+    (after: string) => {
+      // extractGsapScriptText returns null when zero/multiple GSAP scripts are
+      // present — that's an ambiguous/structural change that genuinely needs a full
+      // reload. But a SINGLE-script soft-reloadable edit must not escalate to a full
+      // remount even if applySoftReload reports failure (same U4 invariant as
+      // applyPreviewSync): the live state is already correct, and a remount re-inlines
+      // subcomps + reverts their keyframes.
+      const script = extractGsapScriptText(after);
+      if (script) {
+        // Soft-reload in place. reloadPreview is the ASYNC-failure escalation — a
+        // plugin-CDN load error genuinely breaks the iframe → full reload. Per U4, a
+        // synchronous "verify-failed" (transient empty __timelines) does NOT escalate,
+        // but a "cannot-soft-reload" (structural failure) does.
+        softReloadOrEscalate(previewIframeRef.current, script, reloadPreview, "sdk_refresh");
+      } else {
+        reloadPreview();
+      }
+      onCacheInvalidate();
+    },
+    [previewIframeRef, reloadPreview, onCacheInvalidate],
+  );
+  // Reuse the SAME per-file serializer the legacy commitMutation path uses, so
+  // SDK gsap-write flushes serialize against legacy commits AND each other —
+  // overlapping same-file read-modify-writes can't interleave and lose an edit.
+  const serializeByFile = useCallback(
+    <T>(key: string, task: () => Promise<T>): Promise<T> => serializerRef.current(key, task),
+    [],
+  );
+  // Read the on-disk bytes of targetPath so the SDK GSAP persist captures the
+  // exact prior content as its undo `before` (matching the style/delete paths),
+  // instead of a normalized full-DOM re-emit that would reformat the whole file.
+  const readProjectFileContent = useCallback(
+    async (path: string): Promise<string> => {
+      const pid = projectIdRef.current;
+      if (!pid) throw new Error("No active project");
+      const res = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(path)}`);
+      if (!res.ok) throw new Error(`Failed to read ${path}`);
+      const data = (await res.json()) as { content?: string };
+      if (typeof data.content !== "string") throw new Error(`Missing file contents for ${path}`);
+      return data.content;
+    },
+    [projectIdRef],
+  );
+  const sdkDeps = useMemo<CutoverDeps | null>(
+    () =>
+      writeProjectFile
+        ? {
+            editHistory: { recordEdit: editHistory.recordEdit },
+            writeProjectFile,
+            reloadPreview,
+            domEditSaveTimestampRef,
+            refresh: sdkRefresh,
+            compositionPath: activeCompPath,
+            serialize: serializeByFile,
+            readProjectFile: readProjectFileContent,
+          }
+        : null,
+    [
+      editHistory.recordEdit,
+      writeProjectFile,
+      reloadPreview,
+      domEditSaveTimestampRef,
+      sdkRefresh,
+      activeCompPath,
+      serializeByFile,
+      readProjectFileContent,
+    ],
+  );
+
+  const propertyOps = useGsapPropertyDebounce(commitMutationSafely, {
+    sdkSession,
+    sdkDeps,
+    activeCompPath,
+  });
+  const animationOps = useGsapAnimationOps({
+    projectIdRef,
+    activeCompPath,
+    commitMutation,
+    commitMutationSafely,
+    showToast,
+    sdkSession,
+    sdkDeps,
+  });
+  const keyframeOps = useGsapKeyframeOps({
+    activeCompPath,
+    commitMutation,
+    commitMutationSafely,
+    trackGsapSaveFailure,
+    sdkSession,
+    sdkDeps,
+  });
   const arcPathOps = useGsapArcPathOps(commitMutationSafely);
   return { commitMutation, ...propertyOps, ...animationOps, ...keyframeOps, ...arcPathOps };
 }

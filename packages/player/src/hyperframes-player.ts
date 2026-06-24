@@ -3,6 +3,7 @@ import { isControlsClick, setupControls, setupPoster } from "./controls-setup.js
 import { adoptShadowStyles, createCompositionIframe, scaleIframeToFit } from "./iframe-dom.js";
 import { DirectTimelineClock } from "./direct-timeline-clock.js";
 import { ParentMediaManager } from "./parent-media.js";
+import { isRealmHtmlMediaElement } from "./media-element-guards.js";
 import { handleRuntimeMessage } from "./runtime-message-handler.js";
 import {
   SHADER_CAPTURE_SCALE_ATTR,
@@ -89,6 +90,7 @@ class HyperframesPlayer extends HTMLElement {
   private _directTimelineClock: DirectTimelineClock;
   private _parentTickRaf: number | null = null;
   private _media: ParentMediaManager;
+  private _scenes: { id: string; start: number; duration: number }[] = [];
 
   constructor() {
     super();
@@ -261,6 +263,12 @@ class HyperframesPlayer extends HTMLElement {
     return this.iframe;
   }
 
+  /** Scene list from the last-received runtime timeline message. Empty until
+   *  the composition runtime fires its first "timeline" postMessage. */
+  get scenes(): { id: string; start: number; duration: number }[] {
+    return this._scenes;
+  }
+
   play() {
     this.posterEl?.remove();
     this.posterEl = null;
@@ -300,6 +308,12 @@ class HyperframesPlayer extends HTMLElement {
     this._paused = true;
     this.controlsApi?.updatePlaying(false);
     this.dispatchEvent(new Event("pause"));
+  }
+
+  stopMedia() {
+    this._sendControl("stop-media");
+    this._stopIframeMedia();
+    this._media.stopAdoptedMedia();
   }
 
   seek(timeInSeconds: number) {
@@ -416,6 +430,10 @@ class HyperframesPlayer extends HTMLElement {
     return this.hasAttribute("audio-locked") || this._isLockedHostEnvironment();
   }
 
+  private _isSlideshowPlayer(): boolean {
+    return this.closest("hyperframes-slideshow") !== null;
+  }
+
   /** Apply a change to the `muted` attribute: re-assert under an audio lock,
    *  else mute/unmute the media, sync the controls, and fire `volumechange`. */
   private _handleMutedChange(val: string | null): void {
@@ -427,6 +445,7 @@ class HyperframesPlayer extends HTMLElement {
       return;
     }
     this._media.updateMuted(val !== null);
+    this._setIframeMediaMuted(val !== null);
     this._sendControl("set-muted", { muted: val !== null });
     this.controlsApi?.updateMuted(val !== null);
     this.dispatchEvent(new Event("volumechange"));
@@ -470,6 +489,35 @@ class HyperframesPlayer extends HTMLElement {
   }
 
   /**
+   * Returns the iframe's contentDocument if same-origin and reachable,
+   * otherwise null. Accessing contentDocument can throw on cross-origin
+   * iframes — this swallows that as a clean null sentinel.
+   */
+  private _getSameOriginIframeDocument(): Document | null {
+    try {
+      return this.iframe.contentDocument;
+    } catch {
+      return null;
+    }
+  }
+
+  private _setIframeMediaMuted(muted: boolean): void {
+    const iframeDoc = this._getSameOriginIframeDocument();
+    if (!iframeDoc) return;
+    for (const el of iframeDoc.querySelectorAll("video, audio")) {
+      if (isRealmHtmlMediaElement(el)) el.muted = muted || el.defaultMuted;
+    }
+  }
+
+  private _stopIframeMedia(): void {
+    const iframeDoc = this._getSameOriginIframeDocument();
+    if (!iframeDoc) return;
+    for (const el of iframeDoc.querySelectorAll("video, audio")) {
+      if (isRealmHtmlMediaElement(el)) el.pause();
+    }
+  }
+
+  /**
    * Replay current bridge state to the iframe runtime. Triggered when the
    * runtime announces `{type: "ready"}` — repairs the race where the parent
    * posts control messages before the iframe's bridge listener is installed
@@ -482,6 +530,12 @@ class HyperframesPlayer extends HTMLElement {
     this._sendControl("set-muted", { muted: this.muted });
     this._sendControl("set-volume", { volume: this._volume });
     this._sendControl("set-playback-rate", { playbackRate: this.playbackRate });
+    this._sendControl("set-native-media-sync-disabled", {
+      disabled: this._isSlideshowPlayer(),
+    });
+    this._sendControl("set-web-audio-media-disabled", {
+      disabled: this._isSlideshowPlayer(),
+    });
   }
 
   private _reloadShaderOptions(): void {
@@ -524,7 +578,10 @@ class HyperframesPlayer extends HTMLElement {
   // GSAP seek() preserves play state; player seek() contract lands paused.
   private _tryDirectTimelineSeek(t: number): boolean {
     return this._withDirectTimeline((tl) => {
-      tl.seek(t);
+      // suppressEvents=false: fire the timeline's onUpdate so compositions that
+      // drive scene visibility imperatively (via the root timeline's onUpdate,
+      // e.g. slideshow decks) repaint on a paused seek — not only while playing.
+      tl.seek(t, false);
       tl.pause();
     });
   }
@@ -586,6 +643,12 @@ class HyperframesPlayer extends HTMLElement {
       sendControl: (action, extra) => this._sendControl(action, extra),
       getIframeDoc: () => this.iframe.contentDocument,
       onRuntimeReady: () => this._replayBridgeState(),
+      onRuntimeTimelineReady: (duration) => this._onRuntimeTimelineReady(duration),
+      shouldPromoteMediaAutoplayFallback: () => !this._isSlideshowPlayer(),
+      setScenes: (scenes) => {
+        this._scenes = scenes;
+        this.dispatchEvent(new CustomEvent("scenes", { detail: { scenes } }));
+      },
       updateControlsTime: (t, d) => this.controlsApi?.updateTime(t, d),
       updateControlsPlaying: (p) => this.controlsApi?.updatePlaying(p),
       dispatchEvent: (ev) => this.dispatchEvent(ev),
@@ -594,6 +657,23 @@ class HyperframesPlayer extends HTMLElement {
       getLoop: () => this.loop,
       media: this._media,
     });
+  }
+
+  private _onRuntimeTimelineReady(duration: number) {
+    if (this._ready) return;
+    this.probe.stop();
+    this._duration = duration;
+    this._directTimelineAdapter = null;
+    this._ready = true;
+    this.controlsApi?.updateTime(this._currentTime, duration);
+    this.dispatchEvent(new CustomEvent("ready", { detail: { duration } }));
+
+    const doc = this._getSameOriginIframeDocument();
+    if (doc) this._media.setupFromIframe(doc);
+
+    this._replayBridgeState();
+    this._setIframeMediaMuted(this.muted);
+    if (this.hasAttribute("autoplay")) this.play();
   }
 
   private _onProbeReady({ duration, adapter, compositionSize }: ProbeResult) {
@@ -613,6 +693,7 @@ class HyperframesPlayer extends HTMLElement {
     } catch {
       /* cross-origin */
     }
+    this._setIframeMediaMuted(this.muted);
     if (this.hasAttribute("autoplay")) this.play();
   }
 

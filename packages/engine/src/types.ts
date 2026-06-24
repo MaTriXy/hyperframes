@@ -93,6 +93,13 @@ export interface CaptureOptions {
   quality?: number;
   deviceScaleFactor?: number;
   /**
+   * Opt into Chrome's capture-beyond-viewport screenshot path. Keep this off
+   * for ordinary viewport-sized captures because it is substantially slower in
+   * Chrome's screenshot compositor path. Enable for known compositor edge cases
+   * such as native video surfaces in tall portrait renders.
+   */
+  captureBeyondViewport?: boolean;
+  /**
    * FFmpeg-probed intrinsic dimensions for videos whose frames are injected
    * out-of-band. Applied before the readiness wait so layout that depends on
    * video aspect ratio (e.g. `height:auto`) stays stable even if Chromium never
@@ -160,6 +167,26 @@ export interface CapturePerfSummary {
   avgSeekMs: number;
   avgBeforeCaptureMs: number;
   avgScreenshotMs: number;
+  /**
+   * Frames served from the static-dedup cache instead of a real seek+screenshot
+   * (opt-out HF_STATIC_DEDUP=false). 0 when dedup was off or never armed. NOT counted
+   * in `frames` (reuses are excluded so they don't dilute the per-frame
+   * averages) — the captured total this session is `frames + staticDedupReused`.
+   */
+  staticDedupReused: number;
+  /** `HF_STATIC_DEDUP=true` was set for this render (adoption signal). */
+  staticDedupEnabled: boolean;
+  /** Dedup passed every gate + verification and was active. */
+  staticDedupArmed: boolean;
+  /** Predicted reusable frame count when armed; 0 otherwise. */
+  staticDedupPredicted: number;
+  /**
+   * Low-cardinality reason dedup did not arm: `capture_mode` | `video_injection`
+   * | `page_composite` | `ineligible` | `verification_failed` | `verification_budget`.
+   * Undefined when armed or when dedup was disabled. (Render-level aggregation may
+   * `|`-join distinct reasons when parallel workers diverge.)
+   */
+  staticDedupSkipReason?: string;
 }
 
 // ── Global Augmentation ────────────────────────────────────────────────────────

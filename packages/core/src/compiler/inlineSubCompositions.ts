@@ -13,6 +13,7 @@ import {
   rewriteCssAssetUrls,
   rewriteInlineStyleAssetUrls,
 } from "./rewriteSubCompPaths";
+import { queryByAttr } from "../utils/cssSelector";
 import {
   scopeCssToComposition,
   wrapInlineScriptWithErrorBoundary,
@@ -124,24 +125,6 @@ function defaultBuildScopeSelector(compId: string): string {
   return `[data-composition-id="${escaped}"]`;
 }
 
-function emptyCompositionHtmlError(src: string): Error {
-  return new Error(
-    `Composition HTML is empty or could not be parsed: ${src}. Check that the file referenced by data-composition-src contains valid HTML.`,
-  );
-}
-
-function assertNonEmptyCompositionHtml(html: string, src: string): void {
-  if (!html.trim()) {
-    throw emptyCompositionHtmlError(src);
-  }
-}
-
-function assertParsedCompositionDocument(doc: Document, src: string): void {
-  if (!doc.documentElement) {
-    throw emptyCompositionHtmlError(src);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Core implementation
 // ---------------------------------------------------------------------------
@@ -193,16 +176,16 @@ export function inlineSubCompositions(
     if (!src) continue;
 
     const compHtml = resolveHtml(src);
-    if (compHtml == null) {
-      if (onMissingComposition) {
-        onMissingComposition(src);
-      }
+    if (compHtml == null || !compHtml.trim()) {
+      onMissingComposition?.(src);
       continue;
     }
 
-    assertNonEmptyCompositionHtml(compHtml, src);
     const compDoc = parseHtml(compHtml);
-    assertParsedCompositionDocument(compDoc, src);
+    if (!compDoc.documentElement) {
+      onMissingComposition?.(src);
+      continue;
+    }
 
     // Determine composition IDs
     let compId: string | null;
@@ -219,13 +202,19 @@ export function inlineSubCompositions(
     // Find content: prefer <template>, fall back to <body>
     const contentRoot = compDoc.querySelector("template");
     const contentHtml = contentRoot ? contentRoot.innerHTML || "" : compDoc.body?.innerHTML || "";
-    assertNonEmptyCompositionHtml(contentHtml, src);
+    if (!contentHtml.trim()) {
+      onMissingComposition?.(src);
+      continue;
+    }
     const contentDoc = parseHtml(contentHtml);
-    assertParsedCompositionDocument(contentDoc, src);
+    if (!contentDoc.documentElement) {
+      onMissingComposition?.(src);
+      continue;
+    }
 
     // Find the inner composition root
     const innerRoot = compId
-      ? contentDoc.querySelector(`[data-composition-id="${compId}"]`)
+      ? queryByAttr(contentDoc, "data-composition-id", compId)
       : contentDoc.querySelector("[data-composition-id]");
     const inferredCompId = innerRoot?.getAttribute("data-composition-id")?.trim() || "";
     const authoredRootId = innerRoot?.getAttribute("id")?.trim() || null;

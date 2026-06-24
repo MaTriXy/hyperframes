@@ -536,6 +536,29 @@ describe("removeElementFromHtml", () => {
     expect(updated).not.toContain('id="el1"');
     expect(updated).toContain('id="el2"');
   });
+
+  it("strips ALL gsap tweens for the removed element, not just the first", () => {
+    // Two tweens on the same element → count-based ids renumber when the first is
+    // removed, so a single up-front parse left the second tween orphaned.
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div id="stage">
+    <div id="box" data-hf-id="box" data-start="0" data-end="5">box</div>
+  </div>
+  <script>
+    var tl = gsap.timeline({ paused: true });
+    tl.to("[data-hf-id=\\"box\\"]", { x: 100, duration: 1 }, 0);
+    tl.to("[data-hf-id=\\"box\\"]", { x: 200, duration: 1 }, 1);
+  </script>
+</body></html>`;
+
+    const updated = removeElementFromHtml(html, "box");
+
+    expect(updated).not.toContain('data-hf-id="box"');
+    // Neither tween may survive — the orphaned second tl.to referenced a deleted element.
+    expect(updated).not.toContain("x: 100");
+    expect(updated).not.toContain("x: 200");
+  });
 });
 
 describe("validateCompositionHtml", () => {
@@ -643,13 +666,9 @@ describe("extractCompositionMetadata", () => {
     expect(meta.variables[1].type).toBe("number");
   });
 
-  // T9 — CompositionVariable font/image parse (spec for R1).
-  // These tests are intentionally red until R1 adds "font" and "image" to
-  // CompositionVariableType and updates parseCompositionVariables accordingly.
-  // Currently failing (spec): tests 1, 2, 3 — filter rejects unknown types.
-  // Currently passing (baseline): test 4 — unknown type graceful rejection already works.
+  // T9 — CompositionVariable font/image parse (WS-B R1 implemented).
 
-  it.fails("[spec] parses a font variable (type: font) with name and source", () => {
+  it("parses a font variable (type: font) with name and source", () => {
     const variables = JSON.stringify([
       {
         id: "brand-font-primary",
@@ -676,7 +695,7 @@ describe("extractCompositionMetadata", () => {
     expect((v as Record<string, unknown>)?.default_source).toBe("");
   });
 
-  it.fails("[spec] parses an image variable with brandRole logo:primary", () => {
+  it("parses an image variable with brandRole logo:primary", () => {
     const variables = JSON.stringify([
       { id: "brand-logo", type: "image", label: "Logo", default: "", brandRole: "logo:primary" },
     ]);
@@ -687,7 +706,6 @@ describe("extractCompositionMetadata", () => {
     const v = meta.variables.find((x) => x.id === "brand-logo");
     expect(v).toBeDefined();
     expect(v?.type).toBe("image");
-    // TODO(R1): remove cast once ImageVariable.brandRole is typed
     expect((v as Record<string, unknown>)?.brandRole).toBe("logo:primary");
   });
 

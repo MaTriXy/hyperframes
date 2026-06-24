@@ -12,6 +12,9 @@ import type {
 } from "../core.types";
 import { validateCompositionGsap } from "./gsapSerialize";
 import { ensureHfIds } from "./hfIds.js";
+import { parseGsapScriptAcornForWrite } from "./gsapParserAcorn.js";
+import { queryByAttr } from "../utils/cssSelector";
+import { removeAnimationFromScript } from "./gsapWriterAcorn.js";
 import type { ValidationResult } from "../core.types";
 
 const MEDIA_TYPES = new Set<string>(["video", "image", "audio"]);
@@ -517,7 +520,7 @@ export function updateElementInHtml(
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
 
-  const el = doc.getElementById(elementId) || doc.querySelector(`[data-name="${elementId}"]`);
+  const el = doc.getElementById(elementId) || queryByAttr(doc, "data-name", elementId);
   if (!el) return html;
 
   if (updates.startTime !== undefined) {
@@ -672,15 +675,49 @@ export function addElementToHtml(
   };
 }
 
+function selectorTargetsId(selector: string, id: string): boolean {
+  return (
+    selector === `#${id}` ||
+    selector === `[data-hf-id="${id}"]` ||
+    selector === `[data-hf-id='${id}']`
+  );
+}
+
+function stripGsapForId(script: string, elementId: string): string {
+  // Re-parse after every removal. Animation ids are count-based (positional), so
+  // removing one tween renumbers the survivors — ids captured from a single
+  // up-front parse go stale and silently no-op, orphaning later tweens on the
+  // now-deleted element. Always remove the FIRST still-matching animation in a
+  // freshly-parsed script until none remain.
+  let current = script;
+  for (;;) {
+    const parsed = parseGsapScriptAcornForWrite(current);
+    if (!parsed) return current;
+    const match = parsed.located.find((l) =>
+      selectorTargetsId(l.animation.targetSelector, elementId),
+    );
+    if (!match) return current;
+    const updated = removeAnimationFromScript(current, match.id);
+    // Guard against a non-removing match (would otherwise loop forever).
+    if (updated === current) return current;
+    current = updated;
+  }
+}
+
+function cascadeRemoveGsapById(doc: Document, elementId: string): void {
+  for (const script of Array.from(doc.querySelectorAll("script"))) {
+    const text = script.textContent ?? "";
+    if (!text.includes("gsap") && !text.includes("ScrollTrigger")) continue;
+    const updated = stripGsapForId(text, elementId);
+    if (updated !== text) script.textContent = updated;
+  }
+}
+
 export function removeElementFromHtml(html: string, elementId: string): string {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
-
-  const el = doc.getElementById(elementId);
-  if (el) {
-    el.remove();
-  }
-
+  doc.getElementById(elementId)?.remove();
+  cascadeRemoveGsapById(doc, elementId);
   return "<!DOCTYPE html>\n" + doc.documentElement.outerHTML;
 }
 
@@ -724,7 +761,8 @@ function parseCompositionVariables(htmlEl: Element): CompositionVariable[] {
     return parsed.filter((v): v is CompositionVariable => {
       if (typeof v !== "object" || v === null) return false;
       if (typeof v.id !== "string" || typeof v.label !== "string") return false;
-      if (!["string", "number", "color", "boolean", "enum"].includes(v.type)) return false;
+      if (!["string", "number", "color", "boolean", "enum", "font", "image"].includes(v.type))
+        return false;
 
       switch (v.type) {
         case "string":
@@ -737,6 +775,12 @@ function parseCompositionVariables(htmlEl: Element): CompositionVariable[] {
           return typeof v.default === "boolean";
         case "enum":
           return typeof v.default === "string" && Array.isArray(v.options);
+        case "font":
+          // default is the font-family name string; extra metadata fields are optional
+          return typeof v.default === "string";
+        case "image":
+          // default is the fallback image URL string; extra metadata fields are optional
+          return typeof v.default === "string";
         default:
           return false;
       }

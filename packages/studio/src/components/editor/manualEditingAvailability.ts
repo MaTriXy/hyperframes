@@ -73,7 +73,7 @@ export const STUDIO_COLOR_GRADING_ENABLED = resolveStudioBooleanEnvFlag(
 export const STUDIO_KEYFRAMES_ENABLED = resolveStudioBooleanEnvFlag(
   env,
   ["VITE_STUDIO_ENABLE_KEYFRAMES", "VITE_STUDIO_KEYFRAMES_ENABLED"],
-  false,
+  true,
 );
 
 export const STUDIO_RAZOR_TOOL_ENABLED = resolveStudioBooleanEnvFlag(
@@ -92,26 +92,24 @@ export const STUDIO_STORYBOARD_ENABLED = resolveStudioBooleanEnvFlag(
   false,
 );
 
-// When disabled (the default), drag/resize/rotate commits always take the CSS
-// persist path instead of being intercepted into GSAP script keyframe
-// mutations. The keyframe intercept rewrites timeline tweens from drag
-// gestures and is opt-in until its recording path is hardened.
-export const STUDIO_GSAP_DRAG_INTERCEPT_ENABLED = resolveStudioBooleanEnvFlag(
-  env,
-  ["VITE_STUDIO_ENABLE_GSAP_DRAG_INTERCEPT", "VITE_STUDIO_GSAP_DRAG_INTERCEPT_ENABLED"],
-  true,
-);
-
 export const STUDIO_PREVIEW_SELECTION_ENABLED = STUDIO_INSPECTOR_PANELS_ENABLED;
 
-// Stage 7 Step 3b: shadow dispatch parity mode — dispatches ops to the SDK
-// session alongside the server patch path and logs mismatches via telemetry.
-// Default on: server stays authoritative (no user-visible change), so we want
-// the sdk_shadow_dispatch parity signal from all traffic. Disable via
-// VITE_STUDIO_SDK_SHADOW_ENABLED=false.
-export const STUDIO_SDK_SHADOW_ENABLED = resolveStudioBooleanEnvFlag(
+// Stage 7 Step 3c: SDK cutover — routes inline-style ops through SDK dispatch
+// instead of the server patch-element API. Default false; enable via
+// VITE_STUDIO_SDK_CUTOVER_ENABLED=true. Requires SDK session to be open.
+export const STUDIO_SDK_CUTOVER_ENABLED = resolveStudioBooleanEnvFlag(
   env,
-  ["VITE_STUDIO_SDK_SHADOW_ENABLED"],
+  ["VITE_STUDIO_SDK_CUTOVER_ENABLED"],
+  false,
+);
+
+// Resolver-parity tripwire (telemetry-only, decoupled from cutover).
+// Runs the SDK resolver alongside any edit and emits sdk_resolver_shadow on
+// divergence. Default true; disable via VITE_STUDIO_SDK_RESOLVER_SHADOW_ENABLED=false.
+// Soak gate: retire once zero element_not_found divergences over a clean window.
+export const STUDIO_SDK_RESOLVER_SHADOW_ENABLED = resolveStudioBooleanEnvFlag(
+  env,
+  ["VITE_STUDIO_SDK_RESOLVER_SHADOW_ENABLED"],
   true,
 );
 

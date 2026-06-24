@@ -71,7 +71,12 @@ import { buildDockerRunArgs, resolveDockerPlatform } from "../utils/dockerRunArg
 import { normalizeErrorMessage } from "../utils/errorMessage.js";
 import { runEnvironmentChecks } from "../browser/preflight.js";
 import type { ProducerLogger, RenderJob } from "@hyperframes/producer";
-import { isVideoFrameFormat, type VideoFrameFormat } from "@hyperframes/engine";
+import {
+  MAX_VP9_CPU_USED,
+  MIN_VP9_CPU_USED,
+  isVideoFrameFormat,
+  type VideoFrameFormat,
+} from "@hyperframes/engine";
 import {
   normalizeResolutionFlag,
   parseFps,
@@ -220,6 +225,11 @@ export default defineCommand({
       type: "string",
       description: "Target video bitrate such as 10M. Mutually exclusive with --crf.",
     },
+    "vp9-cpu-used": {
+      type: "string",
+      description:
+        "libvpx-vp9 -cpu-used value for WebM encodes (-8 to 8). Higher is faster with a larger quality/size tradeoff. Env: PRODUCER_VP9_CPU_USED.",
+    },
     gpu: { type: "boolean", description: "Use GPU encoding", default: false },
     "browser-gpu": {
       type: "boolean",
@@ -229,6 +239,12 @@ export default defineCommand({
     quiet: {
       type: "boolean",
       description: "Suppress verbose output",
+      default: false,
+    },
+    debug: {
+      type: "boolean",
+      description:
+        "Write full render diagnostics and keep intermediate artifacts under the producer .debug directory.",
       default: false,
     },
     strict: {
@@ -538,6 +554,7 @@ export default defineCommand({
     const browserGpuArg = args["browser-gpu"];
     const browserGpuMode = resolveBrowserGpuForCli(useDocker, browserGpuArg);
     const quiet = args.quiet ?? false;
+    const debug = args.debug ?? false;
     const batchJson = args.json ?? false;
     const effectiveQuiet = quiet || (batchPath != null && batchJson);
     const strictAll = args["strict-all"] ?? false;
@@ -567,6 +584,20 @@ export default defineCommand({
         process.exit(1);
       }
       crf = parsed;
+    }
+
+    let vp9CpuUsed: number | undefined;
+    if (args["vp9-cpu-used"] != null) {
+      const raw = args["vp9-cpu-used"];
+      const parsed = Number(raw);
+      if (!Number.isInteger(parsed) || parsed < MIN_VP9_CPU_USED || parsed > MAX_VP9_CPU_USED) {
+        errorBox(
+          "Invalid vp9-cpu-used",
+          `Got "${raw}". Must be an integer between ${MIN_VP9_CPU_USED} and ${MAX_VP9_CPU_USED}.`,
+        );
+        process.exit(1);
+      }
+      vp9CpuUsed = parsed;
     }
 
     if (args["video-bitrate"] != null && !videoBitrate) {
@@ -730,6 +761,7 @@ export default defineCommand({
         browserGpuMode,
         hdrMode,
         crf,
+        vp9CpuUsed,
         videoBitrate,
         quiet: batchQuiet,
         browserPath,
@@ -738,6 +770,7 @@ export default defineCommand({
         pageNavigationTimeoutMs,
         protocolTimeout,
         playerReadyTimeout,
+        debug,
         exitAfterComplete: false,
         throwOnError: true,
         skipFeedback: true,
@@ -786,9 +819,11 @@ export default defineCommand({
         browserGpuMode,
         hdrMode: args.sdr ? "force-sdr" : args.hdr ? "force-hdr" : "auto",
         crf,
+        vp9CpuUsed,
         videoBitrate,
         videoFrameFormat,
         quiet,
+        debug,
         variables,
         entryFile,
         outputResolution,
@@ -809,10 +844,12 @@ export default defineCommand({
         browserGpuMode,
         hdrMode: args.sdr ? "force-sdr" : args.hdr ? "force-hdr" : "auto",
         crf,
+        vp9CpuUsed,
         videoBitrate,
         videoFrameFormat,
         quiet,
         browserPath,
+        debug,
         variables,
         entryFile,
         outputResolution,
@@ -845,9 +882,11 @@ interface RenderOptions {
   browserGpuMode?: "auto" | "hardware" | "software";
   hdrMode: "auto" | "force-hdr" | "force-sdr";
   crf?: number;
+  vp9CpuUsed?: number;
   videoBitrate?: string;
   videoFrameFormat?: VideoFrameFormat;
   quiet: boolean;
+  debug?: boolean;
   browserPath?: string;
   variables?: Record<string, unknown>;
   entryFile?: string;
@@ -1088,6 +1127,7 @@ async function renderDocker(
       browserGpu: options.browserGpuMode === "hardware",
       hdrMode: options.hdrMode,
       crf: options.crf,
+      vp9CpuUsed: options.vp9CpuUsed,
       videoBitrate: options.videoBitrate,
       videoFrameFormat: options.videoFrameFormat,
       quiet: options.quiet,
@@ -1095,6 +1135,7 @@ async function renderDocker(
       entryFile: options.entryFile,
       outputResolution: options.outputResolution,
       pageSideCompositing: options.pageSideCompositing,
+      debug: options.debug,
       pageNavigationTimeoutMs: options.pageNavigationTimeoutMs,
     },
   });
@@ -1177,7 +1218,7 @@ export async function renderLocal(
 
   const startTime = Date.now();
   const logger = createRenderTelemetryLogger(
-    producer.createConsoleLogger?.("info") ?? createNoopProducerLogger(),
+    producer.createConsoleLogger?.(options.debug ? "debug" : "info") ?? createNoopProducerLogger(),
   );
 
   const job = producer.createRenderJob({
@@ -1195,6 +1236,7 @@ export async function renderLocal(
         : {}),
       ...(options.protocolTimeout != null && { protocolTimeout: options.protocolTimeout }),
       ...(options.playerReadyTimeout != null && { playerReadyTimeout: options.playerReadyTimeout }),
+      ...(options.vp9CpuUsed != null ? { vp9CpuUsed: options.vp9CpuUsed } : {}),
     }),
     hdrMode: options.hdrMode,
     crf: options.crf,
@@ -1203,6 +1245,7 @@ export async function renderLocal(
     variables: options.variables,
     entryFile: options.entryFile,
     outputResolution: options.outputResolution,
+    debug: options.debug,
   });
 
   const onProgress = options.quiet
@@ -1412,6 +1455,11 @@ function trackRenderMetrics(
     workers: options.workers ?? perf?.workers,
     docker,
     gpu: options.gpu,
+    staticDedupEnabled: perf?.staticDedup?.enabled,
+    staticDedupArmed: perf?.staticDedup?.armed,
+    staticDedupSkipReason: perf?.staticDedup?.skipReason,
+    staticDedupPredictedFrames: perf?.staticDedup?.predictedFrames,
+    staticDedupReusedFrames: perf?.staticDedup?.reusedFrames,
     compositionDurationMs,
     compositionWidth: perf?.resolution.width,
     compositionHeight: perf?.resolution.height,
@@ -1424,6 +1472,8 @@ function trackRenderMetrics(
     stageVideoExtractMs: stages.videoExtractMs,
     stageAudioProcessMs: stages.audioProcessMs,
     stageCaptureMs: stages.captureMs,
+    stageCaptureSetupMs: stages.captureSetupMs,
+    stageCaptureFrameMs: stages.captureFrameMs,
     stageEncodeMs: stages.encodeMs,
     stageAssembleMs: stages.assembleMs,
     extractResolveMs: extract?.resolveMs,

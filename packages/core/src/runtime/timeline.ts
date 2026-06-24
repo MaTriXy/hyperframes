@@ -4,9 +4,11 @@ import type {
   RuntimeTimelineScene,
   RuntimeTimelineLike,
 } from "./types";
+import { stableClipId } from "./clipTree";
 import { swallow } from "./diagnostics";
 import { readElementPlaybackRate } from "./media";
 import { createRuntimeStartTimeResolver } from "./startResolver";
+import { isSceneLikeCompositionId } from "../slideshow/sceneId";
 
 const AUTHORED_DURATION_ATTR = "data-hf-authored-duration";
 const AUTHORED_END_ATTR = "data-hf-authored-end";
@@ -230,13 +232,6 @@ export function collectRuntimeTimelinePayload(params: {
     }
     return maxWindowEndSeconds > 0 ? maxWindowEndSeconds : null;
   };
-  const isSceneLikeCompositionId = (compositionId: string): boolean => {
-    const normalized = compositionId.trim().toLowerCase();
-    if (!normalized || normalized === "main") return false;
-    if (normalized.includes("caption")) return false;
-    if (normalized.includes("ambient")) return false;
-    return true;
-  };
   const resolveNearestCompositionContext = (
     node: Element,
     root: Element | null,
@@ -430,7 +425,7 @@ export function collectRuntimeTimelinePayload(params: {
               ? "image"
               : "element";
     clips.push({
-      id: (node as HTMLElement).id || nodeCompositionId || null,
+      id: stableClipId(node) ?? nodeCompositionId ?? null,
       label: buildTimelineClipLabel(node, kind, clips.length),
       start,
       duration,

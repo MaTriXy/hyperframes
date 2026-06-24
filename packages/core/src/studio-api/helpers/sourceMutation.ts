@@ -1,6 +1,7 @@
 import { parseHTML } from "linkedom";
 import postcss from "postcss";
 import selectorParser from "postcss-selector-parser";
+import { isAllowedHtmlAttribute, isSafeAttributeValue } from "../../utils/htmlAttrSafety";
 
 export interface SourceMutationTarget {
   id?: string | null;
@@ -131,96 +132,6 @@ export interface PatchOperation {
   type: "inline-style" | "attribute" | "html-attribute" | "text-content";
   property: string;
   value: string | null;
-}
-
-const ALLOWED_HTML_ATTRS = new Set([
-  // Identity & structure
-  "id",
-  "class",
-  "style",
-  "title",
-  "name",
-  "for",
-  "type",
-  // Internationalization
-  "lang",
-  "dir",
-  "translate",
-  // Interaction
-  "hidden",
-  "tabindex",
-  "draggable",
-  "contenteditable",
-  // Accessibility
-  "role",
-  "slot",
-  // Links & navigation
-  "href",
-  "target",
-  "rel",
-  // Media
-  "src",
-  "srcset",
-  "sizes",
-  "alt",
-  "poster",
-  "loading",
-  "decoding",
-  "crossorigin",
-  "preload",
-  "autoplay",
-  "loop",
-  "muted",
-  "controls",
-  "playsinline",
-  // Layout
-  "width",
-  "height",
-  "colspan",
-  "rowspan",
-  "scope",
-  // Form
-  "placeholder",
-  "value",
-  "min",
-  "max",
-  "step",
-  "pattern",
-  "required",
-  "disabled",
-  "readonly",
-  "checked",
-  "selected",
-  "multiple",
-  "accept",
-  "maxlength",
-  "minlength",
-  "rows",
-  "cols",
-  "wrap",
-]);
-
-const DANGEROUS_URI_SCHEMES = /^(?:javascript|vbscript):/i;
-const DANGEROUS_DATA_URI = /^data\s*:\s*text\/html/i;
-
-function isAllowedHtmlAttribute(name: string): boolean {
-  const lower = name.toLowerCase();
-  if (lower.startsWith("on")) return false;
-  if (ALLOWED_HTML_ATTRS.has(lower)) return true;
-  if (lower.startsWith("data-")) return true;
-  if (lower.startsWith("aria-")) return true;
-  return false;
-}
-
-const URI_ATTRS = new Set(["src", "href", "action", "formaction", "poster", "srcset"]);
-
-function isSafeAttributeValue(name: string, value: string): boolean {
-  if (URI_ATTRS.has(name.toLowerCase())) {
-    const trimmed = value.trim();
-    if (DANGEROUS_URI_SCHEMES.test(trimmed)) return false;
-    if (DANGEROUS_DATA_URI.test(trimmed)) return false;
-  }
-  return true;
 }
 
 // fallow-ignore-next-line complexity
@@ -381,12 +292,23 @@ export function splitElementInHtml(
   target: SourceMutationTarget,
   splitTime: number,
   newId: string,
+  fallbackTiming?: { start: number; duration: number },
 ): SplitElementResult {
   const { document, wrappedFragment } = parseSourceDocument(source);
   const el = findTargetElement(document, target);
   if (!el || !isHTMLElement(el)) return { html: source, matched: false, newId: null };
 
-  const { start, duration, usesDataEnd } = resolveElementTiming(el);
+  const timing = resolveElementTiming(el);
+  const { usesDataEnd } = timing;
+  let { start, duration } = timing;
+  // GSAP-animated elements carry their timing in the script, not in data-* attrs,
+  // so the source has no authored duration. Fall back to the store's (GSAP-derived)
+  // range — the runtime windows visibility off data-start/data-duration regardless
+  // of class, so stamping both halves below makes each half show only in its window.
+  if (duration <= 0 && fallbackTiming && fallbackTiming.duration > 0) {
+    start = fallbackTiming.start;
+    duration = fallbackTiming.duration;
+  }
   if (duration <= 0 || splitTime <= start || splitTime >= start + duration) {
     return { html: source, matched: false, newId: null };
   }
@@ -405,6 +327,9 @@ export function splitElementInHtml(
   const clone = el.cloneNode(true) as HTMLElement;
   clone.setAttribute("id", newId);
   clone.removeAttribute("data-hf-id");
+  // Descendants carry their own data-hf-id; leaving them duplicates the id of
+  // every nested node (e.g. an inner <span>), so strip them on the clone too.
+  for (const node of clone.querySelectorAll("[data-hf-id]")) node.removeAttribute("data-hf-id");
   clone.setAttribute("data-start", String(Math.round(splitTime * 1000) / 1000));
   setElementDuration(clone, splitTime, secondDuration, usesDataEnd);
 
@@ -433,7 +358,9 @@ export function splitElementInHtml(
     duplicateCssRulesForId(document, originalId, newId);
   }
 
-  // Trim the original element's duration
+  // Trim the original element's duration. A GSAP element had no data-start; stamp
+  // it so the runtime windows the first half (visibility selects on [data-start]).
+  el.setAttribute("data-start", String(Math.round(start * 1000) / 1000));
   setElementDuration(el, start, firstDuration, usesDataEnd);
 
   // Insert clone after original

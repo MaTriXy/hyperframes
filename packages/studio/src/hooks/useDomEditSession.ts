@@ -1,15 +1,16 @@
-import type { Composition } from "@hyperframes/sdk";
 import type { TimelineElement } from "../player";
 import type { ImportedFontAsset } from "../components/editor/fontAssets";
 import type { EditHistoryKind } from "../utils/editHistory";
 import type { RightPanelTab } from "../utils/studioHelpers";
 import type { PatchTarget } from "../utils/sourcePatcher";
 import type { SidebarTab } from "../components/sidebar/LeftSidebar";
+import type { Composition } from "@hyperframes/sdk";
+import { sdkCutoverPersist, sdkDeletePersist } from "../utils/sdkCutover";
+import { runResolverShadow, recordResolverParity } from "../utils/sdkResolverShadow";
 import { useAskAgentModal } from "./useAskAgentModal";
 import { useDomSelection } from "./useDomSelection";
 import { usePreviewInteraction } from "./usePreviewInteraction";
 import { useDomEditCommits } from "./useDomEditCommits";
-import { runShadowDispatch, runShadowDelete } from "../utils/sdkShadow";
 import { useGsapScriptCommits } from "./useGsapScriptCommits";
 import { useGsapCacheVersion } from "./useGsapTweenCache";
 import { useDomEditWiring } from "./useDomEditWiring";
@@ -60,8 +61,8 @@ export interface UseDomEditSessionParams {
   openSourceForSelection?: (sourceFile: string, target: PatchTarget) => void;
   selectSidebarTab?: (tab: SidebarTab) => void;
   getSidebarTab?: () => SidebarTab;
-  /** Stage 7 Step 3b: SDK session for shadow dispatch parity tracking. */
   sdkSession?: Composition | null;
+  forceReloadSdkSession?: () => void;
 }
 
 // ── Hook ──
@@ -101,6 +102,7 @@ export function useDomEditSession({
   selectSidebarTab,
   getSidebarTab,
   sdkSession,
+  forceReloadSdkSession,
 }: UseDomEditSessionParams) {
   void _setRefreshKey;
   void _readProjectFile;
@@ -195,6 +197,8 @@ export function useDomEditSession({
     onFileContentChanged: updateEditingFileContent,
     showToast,
     sdkSession,
+    writeProjectFile,
+    forceReloadSdkSession,
   });
 
   // ── DOM commit handlers ──
@@ -209,10 +213,8 @@ export function useDomEditSession({
     handleDomTextFieldStyleCommit,
     handleDomAddTextField,
     handleDomRemoveTextField,
-    handleDomPathOffsetCommit,
     handleDomGroupPathOffsetCommit,
     handleDomBoxSizeCommit,
-    handleDomRotationCommit,
     handleDomManualEditsReset,
     handleDomEditElementDelete,
     handleDomZIndexReorderCommit,
@@ -234,10 +236,46 @@ export function useDomEditSession({
     clearDomSelection,
     refreshDomEditSelectionFromPreview,
     buildDomSelectionFromTarget,
-    onDomEditPersisted: sdkSession
-      ? (sel, ops) => runShadowDispatch(sdkSession, sel, ops)
+    forceReloadSdkSession,
+    onTrySdkPersist: sdkSession
+      ? (selection, operations, originalContent, targetPath, options) => {
+          // Resolver shadow runs regardless of the cutover flag — decoupled tripwire.
+          runResolverShadow(sdkSession, selection.hfId, operations);
+          return sdkCutoverPersist(
+            selection,
+            operations,
+            originalContent,
+            targetPath,
+            sdkSession,
+            {
+              editHistory,
+              writeProjectFile,
+              reloadPreview,
+              domEditSaveTimestampRef,
+              compositionPath: activeCompPath,
+            },
+            options,
+          );
+        }
       : undefined,
-    onElementDeleted: sdkSession ? (sel) => runShadowDelete(sdkSession, sel.hfId) : undefined,
+    onTrySdkDelete: sdkSession
+      ? (hfId, originalContent, targetPath) =>
+          sdkDeletePersist(hfId, originalContent, targetPath, sdkSession, {
+            editHistory,
+            writeProjectFile,
+            reloadPreview,
+            domEditSaveTimestampRef,
+            compositionPath: activeCompPath,
+          })
+      : undefined,
+    // Resolver shadow for the z-index reorder edit: it takes the server path (no
+    // SDK persist), but the tripwire is decoupled from cutover — record whether
+    // the SDK resolves each reordered element (the reorderElements op's targets).
+    onReorderShadow: sdkSession
+      ? (targets: string[]) => {
+          for (const target of targets) recordResolverParity(sdkSession, target, "reorderElements");
+        }
+      : undefined,
   });
 
   // ── Wiring: selection sync, GSAP cache, preview sync, selection handlers ──
@@ -344,9 +382,7 @@ export function useDomEditSession({
     bumpGsapCache,
     makeFetchFallback,
     trackGsapInteractionFailure,
-    handleDomPathOffsetCommit,
     handleDomBoxSizeCommit,
-    handleDomRotationCommit,
     addGsapAnimation,
     convertToKeyframes,
     setArcPath,

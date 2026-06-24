@@ -114,6 +114,7 @@ const commandLoaders = {
   add: () => import("./commands/add.js").then((m) => m.default),
   catalog: () => import("./commands/catalog.js").then((m) => m.default),
   play: () => import("./commands/play.js").then((m) => m.default),
+  present: () => import("./commands/present.js").then((m) => m.default),
   preview: () => import("./commands/preview.js").then((m) => m.default),
   publish: () => import("./commands/publish.js").then((m) => m.default),
   render: () => import("./commands/render.js").then((m) => m.default),
@@ -134,6 +135,7 @@ const commandLoaders = {
   skills: () => import("./commands/skills.js").then((m) => m.default),
   feedback: () => import("./commands/feedback.js").then((m) => m.default),
   telemetry: () => import("./commands/telemetry.js").then((m) => m.default),
+  events: () => import("./commands/events.js").then((m) => m.default),
   validate: () => import("./commands/validate.js").then((m) => m.default),
   snapshot: () => import("./commands/snapshot.js").then((m) => m.default),
   capture: () => import("./commands/capture.js").then((m) => m.default),
@@ -193,7 +195,10 @@ let _trackCommandResult:
   | undefined;
 let _printUpdateNotice: (() => void) | undefined;
 
-if (!isHelp && command !== "telemetry" && command !== "unknown") {
+// `events` is a telemetry-internal beacon: it self-tracks + self-flushes, so it
+// skips the per-command wrapper (no duplicate cli_command, no first-run notice
+// printed into a skill's captured output).
+if (!isHelp && command !== "telemetry" && command !== "events" && command !== "unknown") {
   import("./telemetry/index.js").then((mod) => {
     _flush = mod.flush;
     _flushSync = mod.flushSync;
@@ -205,7 +210,9 @@ if (!isHelp && command !== "telemetry" && command !== "unknown") {
   });
 }
 
-if (!isHelp && !hasJsonFlag && command !== "upgrade") {
+// `events` skips the update check too — a skill-usage beacon must not add
+// network latency or trigger a background self-upgrade on the calling skill.
+if (!isHelp && !hasJsonFlag && command !== "upgrade" && command !== "events") {
   // Report any completed auto-install from the previous run first, before
   // kicking off the next check — so the user sees "updated to vX" once and
   // we don't over-print.

@@ -110,12 +110,13 @@ describe("initSandboxRuntimeModular", () => {
     delete window.__playerReady;
     delete window.__renderReady;
     delete window.__hfTimelinesBuilding;
+    delete (window as { THREE?: unknown }).THREE;
     vi.restoreAllMocks();
     window.requestAnimationFrame = originalRequestAnimationFrame;
     window.cancelAnimationFrame = originalCancelAnimationFrame;
   });
 
-  it("uses the shorter live child timeline when the authored window is longer", () => {
+  it("keeps authored composition hosts visible when the live child timeline is shorter", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
     root.setAttribute("data-root", "true");
@@ -142,6 +143,37 @@ describe("initSandboxRuntimeModular", () => {
 
     player?.renderSeek(9);
 
+    expect(child.style.visibility).toBe("visible");
+  });
+
+  it("uses live child timeline duration when a composition host has no authored duration", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    const child = document.createElement("div");
+    child.setAttribute("data-composition-id", "slide-1");
+    child.setAttribute("data-start", "0");
+    root.appendChild(child);
+
+    window.__timelines = {
+      main: createMockTimeline(20),
+      "slide-1": createMockTimeline(8),
+    };
+
+    initSandboxRuntimeModular();
+
+    const player = window.__player;
+    expect(player).toBeDefined();
+
+    player?.renderSeek(7);
+    expect(child.style.visibility).toBe("visible");
+
+    player?.renderSeek(9);
     expect(child.style.visibility).toBe("hidden");
   });
 
@@ -490,7 +522,7 @@ describe("initSandboxRuntimeModular", () => {
     });
   });
 
-  it("does not suppress descendant visibility in render mode (top-level page)", () => {
+  it("hides timed descendants inside a hidden timed clip in render mode", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
     root.setAttribute("data-root", "true");
@@ -506,12 +538,13 @@ describe("initSandboxRuntimeModular", () => {
     panel.setAttribute("data-duration", "2");
     root.appendChild(panel);
 
-    const headline = document.createElement("h1");
-    headline.className = "headline";
-    // Authored child window outlives the parent clip — render keeps legacy behavior.
-    headline.setAttribute("data-start", "0");
-    headline.setAttribute("data-duration", "8");
-    panel.appendChild(headline);
+    const bottomBand = document.createElement("div");
+    bottomBand.className = "bottom-band";
+    // Regression shape: a child strip outlives its parent scene. Without
+    // ancestor suppression it can paint through after the parent has ended.
+    bottomBand.setAttribute("data-start", "0");
+    bottomBand.setAttribute("data-duration", "8");
+    panel.appendChild(bottomBand);
 
     window.__timelines = {
       main: createMockTimeline(8),
@@ -525,7 +558,7 @@ describe("initSandboxRuntimeModular", () => {
     player?.seek(3);
 
     expect(panel.style.visibility).toBe("hidden");
-    expect(headline.style.visibility).toBe("visible");
+    expect(bottomBand.style.visibility).toBe("hidden");
   });
 
   it("does not stamp Studio timing on GSAP targets inside authored timed clips", () => {
@@ -967,6 +1000,56 @@ describe("initSandboxRuntimeModular", () => {
     expect(window.__player?.getDuration()).toBe(10);
   });
 
+  it("waits for THREE.DefaultLoadingManager to drain before publishing render readiness", async () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    window.__timelines = {
+      main: createMockTimeline(10),
+    };
+
+    // Simulate THREE with an in-flight asset load — same shape the three adapter
+    // reads, no actual three.js dependency in tests. `itemsTotal > itemsLoaded`
+    // means "loads pending"; resolving the wait fires `onLoad` after wrapping.
+    const mgr: {
+      itemsLoaded: number;
+      itemsTotal: number;
+      onStart?: ((url: string, loaded: number, total: number) => void) | null;
+      onLoad?: (() => void) | null;
+    } = {
+      itemsLoaded: 0,
+      itemsTotal: 1,
+      onStart: null,
+      onLoad: null,
+    };
+    (window as unknown as { THREE: { DefaultLoadingManager: typeof mgr } }).THREE = {
+      DefaultLoadingManager: mgr,
+    };
+
+    initSandboxRuntimeModular();
+
+    // Player ready, render NOT ready because an asset is pending.
+    expect(window.__playerReady).toBe(true);
+    expect(window.__renderReady).toBe(false);
+    expect(window.__player?.getDuration()).toBe(10);
+
+    // Simulate the asset finishing: drain the queue and fire the (now-wrapped)
+    // onLoad. The adapter's wrapper resolves the readiness promise, which
+    // triggers a re-publish.
+    mgr.itemsLoaded = 1;
+    mgr.onLoad?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(window.__renderReady).toBe(true);
+    expect(window.__player?.getDuration()).toBe(10);
+  });
+
   it("sets __renderReady even without a GSAP timeline (CSS/WAAPI compositions)", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
@@ -1094,6 +1177,57 @@ describe("initSandboxRuntimeModular", () => {
 
     expect(video.muted).toBe(true);
     expect(audio.muted).toBe(false);
+  });
+
+  it("native media sync opt-out leaves user-started media playing while timeline is paused", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "root");
+    root.setAttribute("data-root", "true");
+    root.setAttribute("data-start", "0");
+    root.setAttribute("data-duration", "10");
+    root.setAttribute("data-width", "1920");
+    root.setAttribute("data-height", "1080");
+    document.body.appendChild(root);
+
+    const audio = document.createElement("audio");
+    audio.setAttribute("data-start", "0");
+    audio.setAttribute("data-duration", "10");
+    audio.setAttribute("src", "voiceover.mp3");
+    Object.defineProperty(audio, "duration", { value: 10, configurable: true });
+    Object.defineProperty(audio, "readyState", {
+      value: HTMLMediaElement.HAVE_FUTURE_DATA,
+      configurable: true,
+    });
+    Object.defineProperty(audio, "currentTime", { value: 0, writable: true, configurable: true });
+    Object.defineProperty(audio, "paused", { value: true, writable: true, configurable: true });
+    audio.pause = vi.fn(() => {
+      Object.defineProperty(audio, "paused", {
+        value: true,
+        writable: true,
+        configurable: true,
+      });
+    });
+    root.appendChild(audio);
+
+    window.__timelines = { root: createMockTimeline(10) };
+    initSandboxRuntimeModular();
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: {
+          source: "hf-parent",
+          type: "control",
+          action: "set-native-media-sync-disabled",
+          disabled: true,
+        },
+      }),
+    );
+    Object.defineProperty(audio, "paused", { value: false, writable: true, configurable: true });
+    vi.mocked(audio.pause).mockClear();
+
+    window.__player?.renderSeek(5);
+
+    expect(audio.pause).not.toHaveBeenCalled();
   });
 
   it("skips the per-frame transport re-seek while a Studio manual-edit gesture is active", () => {

@@ -101,6 +101,13 @@ export function trackRenderComplete(
     workers?: number;
     docker: boolean;
     gpu: boolean;
+    // Static-frame dedup outcome (opt-out HF_STATIC_DEDUP=false). Undefined on
+    // render paths with no capture session.
+    staticDedupEnabled?: boolean;
+    staticDedupArmed?: boolean;
+    staticDedupSkipReason?: string;
+    staticDedupPredictedFrames?: number;
+    staticDedupReusedFrames?: number;
     // "cli" when triggered by `hyperframes render` (default), "studio" when
     // triggered by a studio preview-server render (POST /api/projects/:id/render).
     source?: "cli" | "studio";
@@ -122,6 +129,8 @@ export function trackRenderComplete(
     stageVideoExtractMs?: number;
     stageAudioProcessMs?: number;
     stageCaptureMs?: number;
+    stageCaptureSetupMs?: number;
+    stageCaptureFrameMs?: number;
     stageEncodeMs?: number;
     stageAssembleMs?: number;
     // Video-extraction breakdown (from RenderPerfSummary.videoExtractBreakdown)
@@ -149,6 +158,11 @@ export function trackRenderComplete(
       workers: props.workers,
       docker: props.docker,
       gpu: props.gpu,
+      static_dedup_enabled: props.staticDedupEnabled,
+      static_dedup_armed: props.staticDedupArmed,
+      static_dedup_skip_reason: props.staticDedupSkipReason,
+      static_dedup_predicted_frames: props.staticDedupPredictedFrames,
+      static_dedup_reused_frames: props.staticDedupReusedFrames,
       source: props.source ?? "cli",
       composition_duration_ms: props.compositionDurationMs,
       composition_width: props.compositionWidth,
@@ -164,6 +178,8 @@ export function trackRenderComplete(
       stage_video_extract_ms: props.stageVideoExtractMs,
       stage_audio_process_ms: props.stageAudioProcessMs,
       stage_capture_ms: props.stageCaptureMs,
+      stage_capture_setup_ms: props.stageCaptureSetupMs,
+      stage_capture_frame_ms: props.stageCaptureFrameMs,
       stage_encode_ms: props.stageEncodeMs,
       stage_assemble_ms: props.stageAssembleMs,
       extract_resolve_ms: props.extractResolveMs,
@@ -316,6 +332,14 @@ export function trackCommandFailure(command: string, err: unknown): void {
     command,
     kind: "command_error",
   });
+}
+
+// Whisper being absent/uninstallable is an environment prerequisite gap, not a
+// command crash — track it on its own low-severity metric instead of cli_error
+// so the command-failure budget reflects real bugs. `optional` records whether
+// the caller (init / skill pipeline) treated captions as skippable.
+export function trackTranscribeUnavailable(props: { optional: boolean }): void {
+  trackEvent("transcribe_unavailable", { optional: props.optional });
 }
 
 export function trackRenderFeedback(props: {

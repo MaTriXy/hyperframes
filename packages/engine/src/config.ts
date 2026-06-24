@@ -11,6 +11,7 @@ import {
   isLowMemorySystem,
   LOW_MEMORY_TOTAL_MB_THRESHOLD,
 } from "./services/systemMemory.js";
+import { DEFAULT_VP9_CPU_USED, normalizeVp9CpuUsed } from "./services/vp9Options.js";
 
 /**
  * Full engine configuration. All fields are wired through the config
@@ -55,6 +56,12 @@ export interface EngineConfig {
   /** Force screenshot capture mode (skip BeginFrame even on Linux). */
   forceScreenshot: boolean;
   /**
+   * Static-frame dedup: reuse byte-identical frames instead of re-seeking +
+   * re-screenshotting (anchor-verified at init). Default ON; disable via
+   * `HF_STATIC_DEDUP` in {false,0,off}. Only arms in screenshot capture mode.
+   */
+  staticFrameDedup: boolean;
+  /**
    * Low-memory render profile. When `true`, the orchestrator collapses the
    * pipeline to its cheapest shape on memory-constrained hosts: it skips the
    * throwaway auto-worker calibration browser, pins capture to a single
@@ -95,6 +102,11 @@ export interface EngineConfig {
   enablePageSideCompositing: boolean;
 
   // ── Encoding ─────────────────────────────────────────────────────────
+  /**
+   * libvpx-vp9 speed/quality tradeoff. Higher values encode faster with a
+   * larger quality/size tradeoff. FFmpeg accepts integer values from -8 to 8.
+   */
+  vp9CpuUsed: number;
   enableChunkedEncode: boolean;
   chunkSizeFrames: number;
   enableStreamingEncode: boolean;
@@ -208,11 +220,13 @@ export const DEFAULT_CONFIG: EngineConfig = {
   browserTimeout: 120_000,
   protocolTimeout: 300_000,
   forceScreenshot: false,
+  staticFrameDedup: true,
   // Auto-detected per host in `resolveConfig`; defaults off for the raw
   // DEFAULT_CONFIG (used directly by tests and worker-sizing fallbacks).
   lowMemoryMode: false,
   enablePageSideCompositing: true,
 
+  vp9CpuUsed: DEFAULT_VP9_CPU_USED,
   enableChunkedEncode: false,
   chunkSizeFrames: 360,
   enableStreamingEncode: true,
@@ -270,6 +284,11 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     if (raw === undefined) return fallback;
     return raw === "true";
   };
+  const envVp9CpuUsed = (): number => {
+    const raw = env("PRODUCER_VP9_CPU_USED");
+    if (raw === undefined || raw === "") return DEFAULT_CONFIG.vp9CpuUsed;
+    return normalizeVp9CpuUsed(Number(raw));
+  };
   const envBrowserGpuMode = (): EngineConfig["browserGpuMode"] => {
     const raw = env("PRODUCER_BROWSER_GPU_MODE");
     if (raw === "hardware" || raw === "software" || raw === "auto") return raw;
@@ -281,6 +300,11 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     if (raw === "true" || raw === "on" || raw === "1") return true;
     if (raw === "false" || raw === "off" || raw === "0") return false;
     return isLowMemorySystem();
+  };
+  // Opt-OUT: default ON, disabled only by an explicit falsey value.
+  const resolveStaticFrameDedup = (): boolean => {
+    const raw = env("HF_STATIC_DEDUP")?.trim().toLowerCase();
+    return !(raw === "false" || raw === "off" || raw === "0");
   };
 
   // Env-var layer (backward compat)
@@ -307,12 +331,14 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
       : undefined,
 
     forceScreenshot: envBool("PRODUCER_FORCE_SCREENSHOT", DEFAULT_CONFIG.forceScreenshot),
+    staticFrameDedup: resolveStaticFrameDedup(),
     lowMemoryMode: resolveLowMemoryMode(),
     enablePageSideCompositing: envBool(
       "HF_PAGE_SIDE_COMPOSITING",
       DEFAULT_CONFIG.enablePageSideCompositing,
     ),
 
+    vp9CpuUsed: envVp9CpuUsed(),
     enableChunkedEncode: envBool(
       "PRODUCER_ENABLE_CHUNKED_ENCODE",
       DEFAULT_CONFIG.enableChunkedEncode,
@@ -379,9 +405,13 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
   // Remove undefined values so they don't override defaults
   const cleanEnv = Object.fromEntries(Object.entries(fromEnv).filter(([, v]) => v !== undefined));
 
-  return {
+  const merged = {
     ...DEFAULT_CONFIG,
     ...cleanEnv,
     ...overrides,
+  };
+  return {
+    ...merged,
+    vp9CpuUsed: normalizeVp9CpuUsed(merged.vp9CpuUsed),
   };
 }

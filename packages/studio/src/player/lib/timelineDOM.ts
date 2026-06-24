@@ -61,6 +61,10 @@ export {
 // TimelineElement factories
 // ---------------------------------------------------------------------------
 
+function resolveClipTag(clip: ClipManifestClip): string {
+  return clip.tagName || clip.kind || "div";
+}
+
 export function createTimelineElementFromManifestClip(params: {
   clip: ClipManifestClip;
   fallbackIndex: number;
@@ -72,7 +76,7 @@ export function createTimelineElementFromManifestClip(params: {
   const label = getTimelineElementDisplayLabel({
     id: clip.id,
     label: clip.label,
-    tag: clip.tagName || clip.kind,
+    tag: resolveClipTag(clip),
   });
 
   let domId: string | undefined;
@@ -103,7 +107,7 @@ export function createTimelineElementFromManifestClip(params: {
     id: identity.id,
     label,
     key: identity.key,
-    tag: clip.tagName || clip.kind,
+    tag: resolveClipTag(clip),
     start: clip.start,
     duration: clip.duration,
     track: clip.track,
@@ -123,7 +127,8 @@ export function createTimelineElementFromManifestClip(params: {
   if (clip.kind === "composition" && clip.compositionId) {
     let resolvedSrc = clip.compositionSrc;
     if (!resolvedSrc) {
-      hostEl = doc?.querySelector(`[data-composition-id="${clip.compositionId}"]`) ?? hostEl;
+      hostEl =
+        doc?.querySelector(`[data-composition-id="${CSS.escape(clip.compositionId)}"]`) ?? hostEl;
       resolvedSrc =
         hostEl?.getAttribute("data-composition-src") ??
         hostEl?.getAttribute("data-composition-file") ??
